@@ -1,16 +1,58 @@
 #include <HardwareSerial.h>
-#include "config.h"              // ← INCLUDE CONFIG.H
 
 // ============================================
-// ESP32 + PZEM-016 AC Energy Tracking System
-// RS485 Modbus RTU Communication
+// 🔧 CONFIGURATION - EDIT DI SINI SAJA
 // ============================================
 
-// Configuration (dari config.h)
-#define RX_PIN RS485_RX_PIN           // UART2 RX
-#define TX_PIN RS485_TX_PIN           // UART2 TX
-#define BAUDRATE PZEM_BAUDRATE       // PZEM-016 communication speed
-#define PZEM_SLAVE PZEM_SLAVE_ADDRESS // PZEM-016 Modbus slave address
+// 1. HARDWARE PIN CONFIGURATION
+#define RS485_RX_PIN 16           // GPIO 16 - UART2 RX (dari RS485 RO)
+#define RS485_TX_PIN 17           // GPIO 17 - UART2 TX (ke RS485 DI)
+
+// 2. SERIAL COMMUNICATION BAUDRATE
+#define SERIAL_MONITOR_BAUDRATE 115200  // Serial Monitor
+#define PZEM_BAUDRATE 9600              // PZEM-016 (fixed, jangan ubah)
+
+// 3. MODBUS RTU SETTINGS
+#define PZEM_SLAVE_ADDRESS 0x01   // PZEM-016 default slave address
+#define MODBUS_FUNCTION_CODE 0x04 // Read Input Registers
+
+// 4. TIMING CONFIGURATION
+#define MODBUS_READ_TIMEOUT 500    // milliseconds - timeout untuk response
+#define MODBUS_PRE_DELAY 50        // milliseconds - delay sebelum kirim
+#define MODBUS_POST_DELAY 100      // milliseconds - delay setelah kirim
+#define SENSOR_READ_INTERVAL 1000  // milliseconds - baca sensor setiap 1 detik
+
+// 5. SENSOR RANGE LIMITS
+#define VOLTAGE_MIN 0.0f           // V
+#define VOLTAGE_MAX 300.0f         // V
+#define CURRENT_MIN 0.0f           // A
+#define CURRENT_MAX 100.0f         // A
+#define FREQUENCY_MIN 45.0f        // Hz
+#define FREQUENCY_MAX 65.0f        // Hz
+#define POWER_FACTOR_MIN 0.0f      // (0-1)
+#define POWER_FACTOR_MAX 1.0f      // (0-1)
+
+// 6. ALERT THRESHOLDS
+#define ALERT_ENABLE true                  // Aktifkan system alert
+#define ALERT_CURRENT_THRESHOLD 15.0f      // Alert jika arus > 15A
+#define ALERT_POWER_THRESHOLD 3000.0f      // Alert jika daya > 3000W
+#define ALERT_FREQUENCY_MIN 49.5f          // Alert jika frekuensi < 49.5 Hz
+#define ALERT_FREQUENCY_MAX 50.5f          // Alert jika frekuensi > 50.5 Hz
+
+// 7. FEATURE FLAGS (true = aktif, false = nonaktif)
+#define ENABLE_SERIAL_OUTPUT true          // Tampilkan output ke Serial Monitor
+#define ENABLE_DEBUG_MODE false            // Tampilkan raw response bytes
+#define ENABLE_CALCULATED_VALUES true      // Tampilkan Apparent & Reactive Power
+#define VALIDATE_CRC true                  // Validasi CRC16
+
+// 8. CRC16 CONFIGURATION
+#define CRC16_POLYNOMIAL 0xA001           // Modbus CRC16 polynomial
+#define CRC16_INIT_VALUE 0xFFFF           // Modbus CRC16 initial value
+#define PZEM_RESPONSE_LENGTH 25           // 3 + (2×10) + 2 bytes
+
+// ============================================
+// END CONFIGURATION - JANGAN UBAH BAGIAN DI BAWAH INI
+// ============================================
 
 // UART2 Hardware Serial for RS485 communication
 HardwareSerial rs485(2);
@@ -46,7 +88,7 @@ uint16_t calculateCRC16(uint8_t *data, uint8_t length) {
     }
   }
   
-  return crc;  // Return as-is (Low byte first in transmission)
+  return crc;
 }
 
 // ============================================
@@ -85,7 +127,7 @@ bool readResponse(uint8_t *response, uint8_t expectedLen, uint16_t timeout_ms) {
     }
   }
   
-  return (bytesRead > 0);  // Return true if at least some data received
+  return (bytesRead > 0);
 }
 
 // ============================================
@@ -99,7 +141,7 @@ bool validateCRC(uint8_t *response, uint8_t length) {
     uint16_t calculatedCRC = calculateCRC16(response, length - 2);
     
     if (receivedCRC != calculatedCRC) {
-      DEBUG_PRINTLN("❌ CRC mismatch!");
+      Serial.println("❌ CRC validation failed");
       return false;
     }
   #endif
@@ -114,22 +156,22 @@ bool validateSensorRange() {
   bool valid = true;
   
   if (sensorData.voltage < VOLTAGE_MIN || sensorData.voltage > VOLTAGE_MAX) {
-    DEBUG_PRINTLN("⚠️  Voltage out of range!");
+    Serial.println("⚠️  Voltage out of range!");
     valid = false;
   }
   
   if (sensorData.current < CURRENT_MIN || sensorData.current > CURRENT_MAX) {
-    DEBUG_PRINTLN("⚠️  Current out of range!");
+    Serial.println("⚠️  Current out of range!");
     valid = false;
   }
   
   if (sensorData.frequency < FREQUENCY_MIN || sensorData.frequency > FREQUENCY_MAX) {
-    DEBUG_PRINTLN("⚠️  Frequency out of range!");
+    Serial.println("⚠️  Frequency out of range!");
     valid = false;
   }
   
   if (sensorData.powerFactor < POWER_FACTOR_MIN || sensorData.powerFactor > POWER_FACTOR_MAX) {
-    DEBUG_PRINTLN("⚠️  Power factor out of range!");
+    Serial.println("⚠️  Power factor out of range!");
     valid = false;
   }
   
@@ -173,12 +215,10 @@ void checkAlerts() {
 
 // ============================================
 // Read All Parameters from PZEM-016
-// Function Code 0x04: Read Input Registers
 // ============================================
 bool readPZEM() {
   // Modbus RTU Command: Read 10 registers starting from 0x0000
-  // Format: [Slave Addr] [Function Code] [Start Addr Hi] [Start Addr Lo] [Qty Hi] [Qty Lo] [CRC Lo] [CRC Hi]
-  uint8_t cmd[] = {PZEM_SLAVE, MODBUS_FUNCTION_CODE, 0x00, 0x00, 0x00, 0x0A, 0x30, 0x39};
+  uint8_t cmd[] = {PZEM_SLAVE_ADDRESS, MODBUS_FUNCTION_CODE, 0x00, 0x00, 0x00, 0x0A, 0x30, 0x39};
   uint8_t response[PZEM_RESPONSE_LENGTH] = {0};
   
   // Send command
@@ -197,46 +237,50 @@ bool readPZEM() {
   }
   
   #if ENABLE_DEBUG_MODE
-    debugDisplayResponse(response, PZEM_RESPONSE_LENGTH);
+    Serial.print("📥 Raw Response: ");
+    for (uint8_t i = 0; i < PZEM_RESPONSE_LENGTH; i++) {
+      Serial.print("0x");
+      if (response[i] < 0x10) Serial.print("0");
+      Serial.print(response[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
   #endif
   
   // Validate response
   if (!validateCRC(response, PZEM_RESPONSE_LENGTH)) {
-    Serial.println("❌ CRC validation failed");
     return false;
   }
   
   // Parse response data
-  // Response format: [Slave] [Function] [ByteCount] [Data...] [CRC_Lo] [CRC_Hi]
-  
-  // Voltage: Register 0x0000 (2 bytes) - V
-  sensorData.voltage = ((response[3] << 8) | response[4]) / VOLTAGE_DIVISOR;
+  // Voltage: Register 0x0000 (2 bytes) - V (÷10)
+  sensorData.voltage = ((response[3] << 8) | response[4]) / 10.0f;
   
   // Current: Register 0x0001 (2 bytes) - A (÷1000)
   uint16_t currentRaw = (response[5] << 8) | response[6];
-  sensorData.current = currentRaw / CURRENT_DIVISOR;
+  sensorData.current = currentRaw / 1000.0f;
   
   // Power: Register 0x0003 (4 bytes) - W
   uint32_t powerRaw = ((response[7] << 24) | (response[8] << 16) | 
                        (response[9] << 8) | response[10]);
-  sensorData.power = powerRaw / POWER_DIVISOR;
+  sensorData.power = powerRaw / 1.0f;
   
   // Energy: Register 0x0005 (4 bytes) - Wh
   uint32_t energyRaw = ((response[11] << 24) | (response[12] << 16) | 
                         (response[13] << 8) | response[14]);
-  sensorData.energy = energyRaw / ENERGY_DIVISOR;
+  sensorData.energy = energyRaw / 1.0f;
   
   // Frequency: Register 0x0007 (2 bytes) - Hz (÷10)
   uint16_t freqRaw = (response[15] << 8) | response[16];
-  sensorData.frequency = freqRaw / FREQUENCY_DIVISOR;
+  sensorData.frequency = freqRaw / 10.0f;
   
   // Power Factor: Register 0x0008 (2 bytes) - (÷1000)
   uint16_t pfRaw = (response[17] << 8) | response[18];
-  sensorData.powerFactor = pfRaw / POWER_FACTOR_DIVISOR;
+  sensorData.powerFactor = pfRaw / 1000.0f;
   
   // Validate range
   if (!validateSensorRange()) {
-    DEBUG_PRINTLN("⚠️  Some values out of range, but proceeding...");
+    Serial.println("⚠️  Some values out of range, but proceeding...");
   }
   
   // Check alerts
@@ -273,10 +317,9 @@ void displayReadings() {
   float apparentPower = calculateApparentPower();
   float reactivePower = calculateReactivePower();
   
-  // Clear screen effect (optional)
-  Serial.println("\n" + String(50, '='));
+  Serial.println("\n" + String(60, '='));
   Serial.println("  🔋 PZEM-016 SENSOR READINGS");
-  Serial.println(String(50, '='));
+  Serial.println(String(60, '='));
   
   // Basic Parameters
   Serial.print("⚡ Voltage (V)     : ");
@@ -314,26 +357,11 @@ void displayReadings() {
   Serial.print(sensorData.energy, 0);
   Serial.println(" Wh");
   
-  Serial.println(String(50, '='));
+  Serial.println(String(60, '='));
   Serial.print("🕐 Timestamp: ");
-  Serial.println(millis());
+  Serial.print(millis());
+  Serial.println(" ms");
   Serial.println();
-}
-
-// ============================================
-// Debug: Display raw response bytes
-// ============================================
-void debugDisplayResponse(uint8_t *response, uint8_t length) {
-  #if ENABLE_DEBUG_MODE
-    Serial.print("📥 Raw Response: ");
-    for (uint8_t i = 0; i < length; i++) {
-      Serial.print("0x");
-      if (response[i] < 0x10) Serial.print("0");
-      Serial.print(response[i], HEX);
-      Serial.print(" ");
-    }
-    Serial.println();
-  #endif
 }
 
 // ============================================
@@ -348,19 +376,18 @@ void setup() {
   Serial.println("Initializing...");
   
   // RS485 UART (UART2)
-  rs485.begin(BAUDRATE, SERIAL_8N1, RX_PIN, TX_PIN);
+  rs485.begin(PZEM_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
   
   Serial.println("✅ Serial initialized");
   Serial.print("✅ RS485 initialized on GPIO ");
-  Serial.print(RX_PIN);
+  Serial.print(RS485_RX_PIN);
   Serial.print(" (RX), GPIO ");
-  Serial.print(TX_PIN);
+  Serial.print(RS485_TX_PIN);
   Serial.println(" (TX)");
   Serial.println("✅ PZEM-016 Sensor Ready!");
-  Serial.println();
   
   #if ENABLE_DEBUG_MODE
-    Serial.println("🐛 DEBUG MODE ENABLED");
+    Serial.println("\n🐛 DEBUG MODE ENABLED");
   #endif
   
   #if ALERT_ENABLE
@@ -369,6 +396,7 @@ void setup() {
     Serial.println("A");
   #endif
   
+  Serial.println();
   delay(2000);
 }
 
