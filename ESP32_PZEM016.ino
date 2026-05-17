@@ -1,0 +1,290 @@
+#include <HardwareSerial.h>
+
+// ============================================
+// ESP32 + PZEM-016 AC Energy Tracking System
+// RS485 Modbus RTU Communication
+// ============================================
+
+// Configuration
+#define RX_PIN 16        // UART2 RX
+#define TX_PIN 17        // UART2 TX
+#define BAUDRATE 9600    // PZEM-016 communication speed
+#define PZEM_SLAVE 0x01  // PZEM-016 Modbus slave address
+
+// UART2 Hardware Serial for RS485 communication
+HardwareSerial rs485(2);
+
+// Data structure for PZEM-016 readings
+struct PZEM_Data {
+  float voltage;      // V
+  float current;      // A
+  float power;        // W
+  float energy;       // Wh
+  float frequency;    // Hz
+  float powerFactor;  // cos(phi)
+  uint8_t status;     // Operation status
+};
+
+PZEM_Data sensorData = {0};
+
+// ============================================
+// CRC16 Modbus Calculation
+// ============================================
+uint16_t calculateCRC16(uint8_t *data, uint8_t length) {
+  uint16_t crc = 0xFFFF;
+  
+  for (uint8_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x0001) {
+        crc = (crc >> 1) ^ 0xA001;
+      } else {
+        crc = crc >> 1;
+      }
+    }
+  }
+  
+  return crc;  // Return as-is (Low byte first in transmission)
+}
+
+// ============================================
+// Send Modbus RTU Command to PZEM-016
+// ============================================
+bool sendCommand(uint8_t *cmd, uint8_t cmdLen) {
+  // Flush any old data
+  while (rs485.available()) {
+    rs485.read();
+  }
+  
+  // Send command
+  rs485.write(cmd, cmdLen);
+  rs485.flush();
+  
+  return true;
+}
+
+// ============================================
+// Read Response from PZEM-016
+// ============================================
+bool readResponse(uint8_t *response, uint8_t expectedLen, uint16_t timeout_ms) {
+  uint32_t startTime = millis();
+  uint8_t bytesRead = 0;
+  
+  while (millis() - startTime < timeout_ms) {
+    if (rs485.available()) {
+      response[bytesRead] = rs485.read();
+      bytesRead++;
+      
+      if (bytesRead >= expectedLen) {
+        return true;
+      }
+    }
+  }
+  
+  return (bytesRead > 0);  // Return true if at least some data received
+}
+
+// ============================================
+// Validate Modbus Response CRC
+// ============================================
+bool validateCRC(uint8_t *response, uint8_t length) {
+  if (length < 3) return false;
+  
+  uint16_t receivedCRC = (response[length - 2] << 8) | response[length - 1];
+  uint16_t calculatedCRC = calculateCRC16(response, length - 2);
+  
+  return (receivedCRC == calculatedCRC);
+}
+
+// ============================================
+// Read All Parameters from PZEM-016
+// Function Code 0x04: Read Input Registers
+// ============================================
+bool readPZEM() {
+  // Modbus RTU Command: Read 10 registers starting from 0x0000
+  // Format: [Slave Addr] [Function Code] [Start Addr Hi] [Start Addr Lo] [Qty Hi] [Qty Lo] [CRC Lo] [CRC Hi]
+  uint8_t cmd[] = {0x01, 0x04, 0x00, 0x00, 0x00, 0x0A, 0x30, 0x39};
+  uint8_t response[25] = {0};
+  
+  // Send command
+  if (!sendCommand(cmd, sizeof(cmd))) {
+    Serial.println("❌ Failed to send command");
+    return false;
+  }
+  
+  // Wait for response (typically 100-200ms)
+  delay(100);
+  
+  // Read response
+  if (!readResponse(response, 25, 500)) {
+    Serial.println("❌ No response from PZEM-016");
+    return false;
+  }
+  
+  // Validate response
+  if (!validateCRC(response, 25)) {
+    Serial.println("❌ CRC validation failed");
+    return false;
+  }
+  
+  // Parse response data
+  // Response format: [Slave] [Function] [ByteCount] [Data...] [CRC_Lo] [CRC_Hi]
+  
+  // Voltage: Register 0x0000 (2 bytes) - V
+  sensorData.voltage = ((response[3] << 8) | response[4]) / 10.0f;
+  
+  // Current: Register 0x0001 (2 bytes) - A (÷1000)
+  uint16_t currentRaw = (response[5] << 8) | response[6];
+  sensorData.current = currentRaw / 1000.0f;
+  
+  // Power: Register 0x0003 (4 bytes) - W
+  uint32_t powerRaw = ((response[7] << 24) | (response[8] << 16) | 
+                       (response[9] << 8) | response[10]);
+  sensorData.power = powerRaw / 1.0f;
+  
+  // Energy: Register 0x0005 (4 bytes) - Wh
+  uint32_t energyRaw = ((response[11] << 24) | (response[12] << 16) | 
+                        (response[13] << 8) | response[14]);
+  sensorData.energy = energyRaw / 1.0f;
+  
+  // Frequency: Register 0x0007 (2 bytes) - Hz (÷10)
+  uint16_t freqRaw = (response[15] << 8) | response[16];
+  sensorData.frequency = freqRaw / 10.0f;
+  
+  // Power Factor: Register 0x0008 (2 bytes) - (÷1000)
+  uint16_t pfRaw = (response[17] << 8) | response[18];
+  sensorData.powerFactor = pfRaw / 1000.0f;
+  
+  return true;
+}
+
+// ============================================
+// Calculate additional electrical parameters
+// ============================================
+float calculateApparentPower() {
+  if (sensorData.voltage > 0) {
+    return sensorData.voltage * sensorData.current;
+  }
+  return 0;
+}
+
+float calculateReactivePower() {
+  float apparentPower = calculateApparentPower();
+  if (apparentPower > 0 && sensorData.powerFactor > 0) {
+    float pf2 = sensorData.powerFactor * sensorData.powerFactor;
+    return apparentPower * sqrt(1 - pf2);
+  }
+  return 0;
+}
+
+// ============================================
+// Display readings with formatted output
+// ============================================
+void displayReadings() {
+  float apparentPower = calculateApparentPower();
+  float reactivePower = calculateReactivePower();
+  
+  // Clear screen effect (optional)
+  Serial.println("\n" + String(50, '='));
+  Serial.println("  🔋 PZEM-016 SENSOR READINGS");
+  Serial.println(String(50, '='));
+  
+  // Basic Parameters
+  Serial.print("⚡ Voltage (V)     : ");
+  Serial.print(sensorData.voltage, 1);
+  Serial.println(" V");
+  
+  Serial.print("📊 Current (A)     : ");
+  Serial.print(sensorData.current, 3);
+  Serial.println(" A");
+  
+  Serial.print("💡 Power (W)       : ");
+  Serial.print(sensorData.power, 0);
+  Serial.println(" W");
+  
+  Serial.print("📈 Apparent Power  : ");
+  Serial.print(apparentPower, 0);
+  Serial.println(" VA");
+  
+  Serial.print("🔄 Reactive Power  : ");
+  Serial.print(reactivePower, 0);
+  Serial.println(" VAR");
+  
+  // Auxiliary Parameters
+  Serial.print("⏱️  Frequency (Hz)  : ");
+  Serial.print(sensorData.frequency, 1);
+  Serial.println(" Hz");
+  
+  Serial.print("📐 Power Factor    : ");
+  Serial.print(sensorData.powerFactor, 3);
+  Serial.println(" (cos φ)");
+  
+  Serial.print("📦 Energy (Wh)     : ");
+  Serial.print(sensorData.energy, 0);
+  Serial.println(" Wh");
+  
+  Serial.println(String(50, '='));
+  Serial.print("🕐 Timestamp: ");
+  Serial.println(millis());
+  Serial.println();
+}
+
+// ============================================
+// Debug: Display raw response bytes
+// ============================================
+void debugDisplayResponse(uint8_t *response, uint8_t length) {
+  Serial.print("📥 Raw Response: ");
+  for (uint8_t i = 0; i < length; i++) {
+    Serial.print("0x");
+    if (response[i] < 0x10) Serial.print("0");
+    Serial.print(response[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+// ============================================
+// Setup
+// ============================================
+void setup() {
+  // Serial Monitor (USB) - 115200 baud
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n🚀 ESP32 + PZEM-016 Energy Tracking System");
+  Serial.println("Initializing...");
+  
+  // RS485 UART (UART2) - 9600 baud for PZEM-016
+  rs485.begin(BAUDRATE, SERIAL_8N1, RX_PIN, TX_PIN);
+  
+  Serial.println("✅ Serial initialized");
+  Serial.println("✅ RS485 initialized on GPIO 16 (RX), GPIO 17 (TX)");
+  Serial.println("✅ PZEM-016 Sensor Ready!");
+  Serial.println();
+  
+  delay(2000);
+}
+
+// ============================================
+// Main Loop
+// ============================================
+void loop() {
+  Serial.println("📡 Reading PZEM-016...");
+  
+  // Read sensor data
+  if (readPZEM()) {
+    // Display successful reading
+    displayReadings();
+  } else {
+    // Handle read error
+    Serial.println("❌ Failed to read sensor data");
+    Serial.println("   - Check RS485 connections");
+    Serial.println("   - Verify PZEM-016 power supply");
+    Serial.println("   - Check baudrate (9600)");
+    Serial.println();
+  }
+  
+  // Wait before next reading (1 second)
+  delay(1000);
+}
