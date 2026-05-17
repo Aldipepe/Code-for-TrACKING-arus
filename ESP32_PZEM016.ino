@@ -1,15 +1,16 @@
 #include <HardwareSerial.h>
+#include "config.h"              // ← INCLUDE CONFIG.H
 
 // ============================================
 // ESP32 + PZEM-016 AC Energy Tracking System
 // RS485 Modbus RTU Communication
 // ============================================
 
-// Configuration
-#define RX_PIN 16        // UART2 RX
-#define TX_PIN 17        // UART2 TX
-#define BAUDRATE 9600    // PZEM-016 communication speed
-#define PZEM_SLAVE 0x01  // PZEM-016 Modbus slave address
+// Configuration (dari config.h)
+#define RX_PIN RS485_RX_PIN           // UART2 RX
+#define TX_PIN RS485_TX_PIN           // UART2 TX
+#define BAUDRATE PZEM_BAUDRATE       // PZEM-016 communication speed
+#define PZEM_SLAVE PZEM_SLAVE_ADDRESS // PZEM-016 Modbus slave address
 
 // UART2 Hardware Serial for RS485 communication
 HardwareSerial rs485(2);
@@ -31,14 +32,14 @@ PZEM_Data sensorData = {0};
 // CRC16 Modbus Calculation
 // ============================================
 uint16_t calculateCRC16(uint8_t *data, uint8_t length) {
-  uint16_t crc = 0xFFFF;
+  uint16_t crc = CRC16_INIT_VALUE;
   
   for (uint8_t i = 0; i < length; i++) {
     crc ^= data[i];
     
     for (uint8_t j = 0; j < 8; j++) {
       if (crc & 0x0001) {
-        crc = (crc >> 1) ^ 0xA001;
+        crc = (crc >> 1) ^ CRC16_POLYNOMIAL;
       } else {
         crc = crc >> 1;
       }
@@ -56,6 +57,8 @@ bool sendCommand(uint8_t *cmd, uint8_t cmdLen) {
   while (rs485.available()) {
     rs485.read();
   }
+  
+  delay(MODBUS_PRE_DELAY);
   
   // Send command
   rs485.write(cmd, cmdLen);
@@ -91,10 +94,81 @@ bool readResponse(uint8_t *response, uint8_t expectedLen, uint16_t timeout_ms) {
 bool validateCRC(uint8_t *response, uint8_t length) {
   if (length < 3) return false;
   
-  uint16_t receivedCRC = (response[length - 2] << 8) | response[length - 1];
-  uint16_t calculatedCRC = calculateCRC16(response, length - 2);
+  #if VALIDATE_CRC
+    uint16_t receivedCRC = (response[length - 2] << 8) | response[length - 1];
+    uint16_t calculatedCRC = calculateCRC16(response, length - 2);
+    
+    if (receivedCRC != calculatedCRC) {
+      DEBUG_PRINTLN("❌ CRC mismatch!");
+      return false;
+    }
+  #endif
   
-  return (receivedCRC == calculatedCRC);
+  return true;
+}
+
+// ============================================
+// Validate Sensor Data Range
+// ============================================
+bool validateSensorRange() {
+  bool valid = true;
+  
+  if (sensorData.voltage < VOLTAGE_MIN || sensorData.voltage > VOLTAGE_MAX) {
+    DEBUG_PRINTLN("⚠️  Voltage out of range!");
+    valid = false;
+  }
+  
+  if (sensorData.current < CURRENT_MIN || sensorData.current > CURRENT_MAX) {
+    DEBUG_PRINTLN("⚠️  Current out of range!");
+    valid = false;
+  }
+  
+  if (sensorData.frequency < FREQUENCY_MIN || sensorData.frequency > FREQUENCY_MAX) {
+    DEBUG_PRINTLN("⚠️  Frequency out of range!");
+    valid = false;
+  }
+  
+  if (sensorData.powerFactor < POWER_FACTOR_MIN || sensorData.powerFactor > POWER_FACTOR_MAX) {
+    DEBUG_PRINTLN("⚠️  Power factor out of range!");
+    valid = false;
+  }
+  
+  return valid;
+}
+
+// ============================================
+// Check Alerts & Thresholds
+// ============================================
+void checkAlerts() {
+  if (!ALERT_ENABLE) return;
+  
+  if (sensorData.current > ALERT_CURRENT_THRESHOLD) {
+    Serial.print("🚨 ALERT: Current ");
+    Serial.print(sensorData.current);
+    Serial.print("A exceeds threshold ");
+    Serial.println(ALERT_CURRENT_THRESHOLD);
+  }
+  
+  if (sensorData.power > ALERT_POWER_THRESHOLD) {
+    Serial.print("🚨 ALERT: Power ");
+    Serial.print(sensorData.power);
+    Serial.print("W exceeds threshold ");
+    Serial.println(ALERT_POWER_THRESHOLD);
+  }
+  
+  if (sensorData.frequency < ALERT_FREQUENCY_MIN) {
+    Serial.print("🚨 ALERT: Frequency ");
+    Serial.print(sensorData.frequency);
+    Serial.print("Hz below minimum ");
+    Serial.println(ALERT_FREQUENCY_MIN);
+  }
+  
+  if (sensorData.frequency > ALERT_FREQUENCY_MAX) {
+    Serial.print("🚨 ALERT: Frequency ");
+    Serial.print(sensorData.frequency);
+    Serial.print("Hz exceeds maximum ");
+    Serial.println(ALERT_FREQUENCY_MAX);
+  }
 }
 
 // ============================================
@@ -104,8 +178,8 @@ bool validateCRC(uint8_t *response, uint8_t length) {
 bool readPZEM() {
   // Modbus RTU Command: Read 10 registers starting from 0x0000
   // Format: [Slave Addr] [Function Code] [Start Addr Hi] [Start Addr Lo] [Qty Hi] [Qty Lo] [CRC Lo] [CRC Hi]
-  uint8_t cmd[] = {0x01, 0x04, 0x00, 0x00, 0x00, 0x0A, 0x30, 0x39};
-  uint8_t response[25] = {0};
+  uint8_t cmd[] = {PZEM_SLAVE, MODBUS_FUNCTION_CODE, 0x00, 0x00, 0x00, 0x0A, 0x30, 0x39};
+  uint8_t response[PZEM_RESPONSE_LENGTH] = {0};
   
   // Send command
   if (!sendCommand(cmd, sizeof(cmd))) {
@@ -113,17 +187,21 @@ bool readPZEM() {
     return false;
   }
   
-  // Wait for response (typically 100-200ms)
-  delay(100);
+  // Wait for response
+  delay(MODBUS_POST_DELAY);
   
   // Read response
-  if (!readResponse(response, 25, 500)) {
+  if (!readResponse(response, PZEM_RESPONSE_LENGTH, MODBUS_READ_TIMEOUT)) {
     Serial.println("❌ No response from PZEM-016");
     return false;
   }
   
+  #if ENABLE_DEBUG_MODE
+    debugDisplayResponse(response, PZEM_RESPONSE_LENGTH);
+  #endif
+  
   // Validate response
-  if (!validateCRC(response, 25)) {
+  if (!validateCRC(response, PZEM_RESPONSE_LENGTH)) {
     Serial.println("❌ CRC validation failed");
     return false;
   }
@@ -132,29 +210,37 @@ bool readPZEM() {
   // Response format: [Slave] [Function] [ByteCount] [Data...] [CRC_Lo] [CRC_Hi]
   
   // Voltage: Register 0x0000 (2 bytes) - V
-  sensorData.voltage = ((response[3] << 8) | response[4]) / 10.0f;
+  sensorData.voltage = ((response[3] << 8) | response[4]) / VOLTAGE_DIVISOR;
   
   // Current: Register 0x0001 (2 bytes) - A (÷1000)
   uint16_t currentRaw = (response[5] << 8) | response[6];
-  sensorData.current = currentRaw / 1000.0f;
+  sensorData.current = currentRaw / CURRENT_DIVISOR;
   
   // Power: Register 0x0003 (4 bytes) - W
   uint32_t powerRaw = ((response[7] << 24) | (response[8] << 16) | 
                        (response[9] << 8) | response[10]);
-  sensorData.power = powerRaw / 1.0f;
+  sensorData.power = powerRaw / POWER_DIVISOR;
   
   // Energy: Register 0x0005 (4 bytes) - Wh
   uint32_t energyRaw = ((response[11] << 24) | (response[12] << 16) | 
                         (response[13] << 8) | response[14]);
-  sensorData.energy = energyRaw / 1.0f;
+  sensorData.energy = energyRaw / ENERGY_DIVISOR;
   
   // Frequency: Register 0x0007 (2 bytes) - Hz (÷10)
   uint16_t freqRaw = (response[15] << 8) | response[16];
-  sensorData.frequency = freqRaw / 10.0f;
+  sensorData.frequency = freqRaw / FREQUENCY_DIVISOR;
   
   // Power Factor: Register 0x0008 (2 bytes) - (÷1000)
   uint16_t pfRaw = (response[17] << 8) | response[18];
-  sensorData.powerFactor = pfRaw / 1000.0f;
+  sensorData.powerFactor = pfRaw / POWER_FACTOR_DIVISOR;
+  
+  // Validate range
+  if (!validateSensorRange()) {
+    DEBUG_PRINTLN("⚠️  Some values out of range, but proceeding...");
+  }
+  
+  // Check alerts
+  checkAlerts();
   
   return true;
 }
@@ -182,6 +268,8 @@ float calculateReactivePower() {
 // Display readings with formatted output
 // ============================================
 void displayReadings() {
+  if (!ENABLE_SERIAL_OUTPUT) return;
+  
   float apparentPower = calculateApparentPower();
   float reactivePower = calculateReactivePower();
   
@@ -203,13 +291,15 @@ void displayReadings() {
   Serial.print(sensorData.power, 0);
   Serial.println(" W");
   
-  Serial.print("📈 Apparent Power  : ");
-  Serial.print(apparentPower, 0);
-  Serial.println(" VA");
-  
-  Serial.print("🔄 Reactive Power  : ");
-  Serial.print(reactivePower, 0);
-  Serial.println(" VAR");
+  #if ENABLE_CALCULATED_VALUES
+    Serial.print("📈 Apparent Power  : ");
+    Serial.print(apparentPower, 0);
+    Serial.println(" VA");
+    
+    Serial.print("🔄 Reactive Power  : ");
+    Serial.print(reactivePower, 0);
+    Serial.println(" VAR");
+  #endif
   
   // Auxiliary Parameters
   Serial.print("⏱️  Frequency (Hz)  : ");
@@ -234,34 +324,50 @@ void displayReadings() {
 // Debug: Display raw response bytes
 // ============================================
 void debugDisplayResponse(uint8_t *response, uint8_t length) {
-  Serial.print("📥 Raw Response: ");
-  for (uint8_t i = 0; i < length; i++) {
-    Serial.print("0x");
-    if (response[i] < 0x10) Serial.print("0");
-    Serial.print(response[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
+  #if ENABLE_DEBUG_MODE
+    Serial.print("📥 Raw Response: ");
+    for (uint8_t i = 0; i < length; i++) {
+      Serial.print("0x");
+      if (response[i] < 0x10) Serial.print("0");
+      Serial.print(response[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+  #endif
 }
 
 // ============================================
 // Setup
 // ============================================
 void setup() {
-  // Serial Monitor (USB) - 115200 baud
-  Serial.begin(115200);
+  // Serial Monitor (USB)
+  Serial.begin(SERIAL_MONITOR_BAUDRATE);
   delay(1000);
   
   Serial.println("\n🚀 ESP32 + PZEM-016 Energy Tracking System");
   Serial.println("Initializing...");
   
-  // RS485 UART (UART2) - 9600 baud for PZEM-016
+  // RS485 UART (UART2)
   rs485.begin(BAUDRATE, SERIAL_8N1, RX_PIN, TX_PIN);
   
   Serial.println("✅ Serial initialized");
-  Serial.println("✅ RS485 initialized on GPIO 16 (RX), GPIO 17 (TX)");
+  Serial.print("✅ RS485 initialized on GPIO ");
+  Serial.print(RX_PIN);
+  Serial.print(" (RX), GPIO ");
+  Serial.print(TX_PIN);
+  Serial.println(" (TX)");
   Serial.println("✅ PZEM-016 Sensor Ready!");
   Serial.println();
+  
+  #if ENABLE_DEBUG_MODE
+    Serial.println("🐛 DEBUG MODE ENABLED");
+  #endif
+  
+  #if ALERT_ENABLE
+    Serial.print("🚨 ALERTS ENABLED - Current threshold: ");
+    Serial.print(ALERT_CURRENT_THRESHOLD);
+    Serial.println("A");
+  #endif
   
   delay(2000);
 }
@@ -270,21 +376,27 @@ void setup() {
 // Main Loop
 // ============================================
 void loop() {
-  Serial.println("📡 Reading PZEM-016...");
+  static unsigned long lastReadTime = 0;
   
-  // Read sensor data
-  if (readPZEM()) {
-    // Display successful reading
-    displayReadings();
-  } else {
-    // Handle read error
-    Serial.println("❌ Failed to read sensor data");
-    Serial.println("   - Check RS485 connections");
-    Serial.println("   - Verify PZEM-016 power supply");
-    Serial.println("   - Check baudrate (9600)");
-    Serial.println();
+  // Check if it's time to read sensor
+  if (millis() - lastReadTime >= SENSOR_READ_INTERVAL) {
+    lastReadTime = millis();
+    
+    Serial.println("📡 Reading PZEM-016...");
+    
+    // Read sensor data
+    if (readPZEM()) {
+      // Display successful reading
+      displayReadings();
+    } else {
+      // Handle read error
+      Serial.println("❌ Failed to read sensor data");
+      Serial.println("   - Check RS485 connections");
+      Serial.println("   - Verify PZEM-016 power supply");
+      Serial.println("   - Check baudrate (9600)");
+      Serial.println();
+    }
   }
   
-  // Wait before next reading (1 second)
-  delay(1000);
+  delay(10);  // Small delay to prevent watchdog timeout
 }
